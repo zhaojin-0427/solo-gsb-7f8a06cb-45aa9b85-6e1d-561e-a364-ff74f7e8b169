@@ -323,6 +323,236 @@ check("非法 post_ms=2001 返回 400", r_bad.status_code == 400)
 r_bad = export(0, 0, ref_data=b"RIFFxxxx" + b"\0" * 100)
 check("导出非 WAV 返回 400", r_bad.status_code == 400)
 
+# ---------- 7. 片段顺序核验（核心逻辑） ----------
+print("7) 片段顺序核验")
+from app.audio import verify_sequence  # noqa: E402
+
+seq_sr = 16000
+seq_ref_base = lp_noise(10.0, seq_sr, cutoff=3000) * 0.03
+seq_bursts = [
+    lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_sr)) * 0.8)
+    for _ in range(3)
+]
+seq_positions = [1.0, 4.0, 7.0]
+seq_ref = seq_ref_base.copy()
+for b, pos in zip(seq_bursts, seq_positions):
+    p = int(pos * seq_sr)
+    seq_ref[p:p + b.size] += b
+seq_ref_m = bytes_meta(wav_bytes(seq_ref, seq_sr), "参考录音")
+seq_clip_m = [
+    bytes_meta(wav_bytes(b.copy(), seq_sr), f"片段{i + 1}")
+    for i, b in enumerate(seq_bursts)
+]
+
+res = verify_sequence(seq_ref_m, seq_clip_m)
+check("顺序正确状态为 verified", res["status"] == "verified", res.get("status"))
+if res["status"] == "verified":
+    segs = res["chain"]["segments"]
+    check("链含 3 段", len(segs) == 3, str(len(segs)))
+    for s, pos in zip(segs, seq_positions):
+        check(f"段{s['segment']}起点 ≈{pos}s（10ms 内）",
+              abs(s["start_ms"] - int(pos * 1000)) <= 10,
+              f"{s['start_ms']}")
+    check("首段无空档", segs[0]["gap_before_ms"] is None)
+    check("第 2 段空档 ≈2500ms",
+          segs[1]["gap_before_ms"] is not None and
+          abs(segs[1]["gap_before_ms"] - 2500) <= 5, str(segs[1]["gap_before_ms"]))
+    check("第 3 段空档 ≈2500ms",
+          segs[2]["gap_before_ms"] is not None and
+          abs(segs[2]["gap_before_ms"] - 2500) <= 5, str(segs[2]["gap_before_ms"]))
+    check("总分 ≈ 3.0（三段均近满分）",
+          abs(res["chain"]["total_score"] - 3.0) < 0.05,
+          str(res["chain"]["total_score"]))
+
+# 顺序颠倒：无完整链
+res_rev = verify_sequence(seq_ref_m, [seq_clip_m[2], seq_clip_m[1], seq_clip_m[0]])
+check("逆序状态为 no_chain", res_rev["status"] == "no_chain", res_rev.get("status"))
+check("逆序原因为 order_not_satisfied",
+      res_rev.get("reason") == "order_not_satisfied", res_rev.get("reason"))
+check("提示包含「顺序不成立」", "顺序不成立" in res_rev["message"])
+
+# 多解：第 1 段只有一处，第 2 段有两处近满分位置 -> 两条不同完整链
+amb_ref = lp_noise(10.0, seq_sr, cutoff=3000) * 0.03
+ab1 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_sr)) * 0.8)
+ab2 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_sr)) * 0.8)
+p = int(1.0 * seq_sr)
+amb_ref[p:p + ab1.size] += ab1
+for pos in (5.0, 7.5):
+    p = int(pos * seq_sr)
+    amb_ref[p:p + ab2.size] += ab2
+res_amb = verify_sequence(
+    bytes_meta(wav_bytes(amb_ref, seq_sr), "参考录音"),
+    [bytes_meta(wav_bytes(ab1.copy(), seq_sr), "片段1"),
+     bytes_meta(wav_bytes(ab2.copy(), seq_sr), "片段2")],
+)
+check("多解状态为 ambiguous", res_amb["status"] == "ambiguous", res_amb.get("status"))
+if res_amb["status"] == "ambiguous":
+    best_starts = [s["start_ms"] for s in res_amb["best_chain"]["segments"]]
+    alt_starts = [s["start_ms"] for s in res_amb["alternative_chain"]["segments"]]
+    # 两条链第一段都在 1000ms，第二段分别取 5000ms / 7500ms（顺序无关排序）
+    second_starts = sorted([best_starts[1], alt_starts[1]])
+    check("两条链第一段都在 1000ms",
+          best_starts[0] == 1000 and alt_starts[0] == 1000,
+          f"{best_starts} / {alt_starts}")
+    check("两条链第二段为 5000ms 与 7500ms",
+          second_starts == [5000, 7500], str(second_starts))
+    check("两条链确实不同（第二段位置不同）", best_starts != alt_starts)
+    gap = (res_amb["best_chain"]["total_score"]
+           - res_amb["alternative_chain"]["total_score"])
+    check("两条链总分差 <= 0.02", gap <= 0.02 + 1e-9, f"{gap:.4f}")
+    check("提示包含「多」", "多" in res_amb["message"])
+
+# 含低分片段：无完整链（segment_not_found），并指出是哪一段
+foreign_seq = lp_noise(0.5, seq_sr, cutoff=2000)
+res_nf = verify_sequence(
+    seq_ref_m,
+    [seq_clip_m[0], bytes_meta(wav_bytes(foreign_seq, seq_sr), "片段2")],
+)
+check("含低分片段状态为 no_chain", res_nf["status"] == "no_chain")
+check("原因为 segment_not_found", res_nf["reason"] == "segment_not_found")
+check("指出第 2 段失败",
+      [f["segment"] for f in res_nf["failed_segments"]] == [2],
+      str(res_nf["failed_segments"]))
+
+# 近静音片段
+silent_seg = np.zeros(int(0.5 * seq_sr)) + 0.0001
+res_si = verify_sequence(
+    seq_ref_m,
+    [seq_clip_m[0], bytes_meta(wav_bytes(silent_seg, seq_sr), "片段2")],
+)
+check("静音片段原因 silence",
+      res_si["status"] == "no_chain"
+      and res_si["failed_segments"][0]["reason"] == "silence")
+
+# 较低分候选（仍 >=0.8）被保留：仅它能与后段成链时链成立
+lr = np.random.default_rng(20260926)
+low_ref = lp_noise(10.0, seq_sr, cutoff=3000) * 0.03
+lb1 = lfilter(firwin(101, 0.5), 1.0, lr.standard_normal(int(0.5 * seq_sr)) * 0.8)
+lb2 = lfilter(firwin(101, 0.5), 1.0, lr.standard_normal(int(0.5 * seq_sr)) * 0.8)
+# 片段1：受扰（较低分但仍 >=0.8）副本在 1.0s，干净副本在 6.0s
+p = int(1.0 * seq_sr)
+low_ref[p:p + lb1.size] += lb1 * 0.8 + lr.standard_normal(lb1.size) * 0.22
+p = int(6.0 * seq_sr)
+low_ref[p:p + lb1.size] += lb1
+# 片段2 在 3.0s：1.0s 低分副本可以接上（3.0 >= 1.5），
+# 6.0s 高分副本在其后、无法成链——必须保留低分候选才有完整链
+p = int(3.0 * seq_sr)
+low_ref[p:p + lb2.size] += lb2
+res_low = verify_sequence(
+    bytes_meta(wav_bytes(low_ref, seq_sr), "参考录音"),
+    [bytes_meta(wav_bytes(lb1.copy(), seq_sr), "片段1"),
+     bytes_meta(wav_bytes(lb2.copy(), seq_sr), "片段2")],
+)
+check("较低分候选场景有解",
+      res_low["status"] in ("verified", "ambiguous"), res_low.get("status"))
+if res_low["status"] in ("verified", "ambiguous"):
+    chain = (res_low["chain"] if res_low["status"] == "verified"
+             else res_low["best_chain"])
+    check("最高链采用 1.0s 处的较低分候选（低分候选被保留）",
+          abs(chain["segments"][0]["start_ms"] - 1000) <= 10
+          and chain["segments"][0]["score"] < 0.95,
+          f"{chain['segments'][0]['start_ms']}@"
+          f"{chain['segments'][0]['score']}")
+    check("最高链第 2 段在 3.0s",
+          abs(chain["segments"][1]["start_ms"] - 3000) <= 10,
+          str(chain["segments"][1]["start_ms"]))
+
+# 相邻片段首尾相接（空档 0）允许
+touch_ref = lp_noise(10.0, seq_sr, cutoff=3000) * 0.03
+tb1 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_sr)) * 0.8)
+tb2 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_sr)) * 0.8)
+p = int(2.0 * seq_sr)
+touch_ref[p:p + tb1.size] += tb1
+touch_ref[p + tb1.size:p + tb1.size + tb2.size] += tb2
+res_touch = verify_sequence(
+    bytes_meta(wav_bytes(touch_ref, seq_sr), "参考录音"),
+    [bytes_meta(wav_bytes(tb1.copy(), seq_sr), "片段1"),
+     bytes_meta(wav_bytes(tb2.copy(), seq_sr), "片段2")],
+)
+check("首尾相接（空档 0）链成立",
+      res_touch["status"] == "verified"
+      and res_touch["chain"]["segments"][1]["gap_before_ms"] == 0,
+      res_touch.get("status"))
+
+# 各段采样率不同：毫秒换算必须按各段自身分析采样率，公共轴仅用于拼链
+mr_ref = lp_noise(10.0, seq_sr, cutoff=6000) * 0.03
+mb1 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.6 * seq_sr)) * 0.8)
+mb2 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.6 * seq_sr)) * 0.8)
+p = int(1.0 * seq_sr)
+mr_ref[p:p + mb1.size] += mb1
+p = int(3.2 * seq_sr)
+mr_ref[p:p + mb2.size] += mb2
+res_mr = verify_sequence(
+    bytes_meta(wav_bytes(mr_ref, seq_sr), "参考录音"),
+    [bytes_meta(wav_bytes(resample_poly(mb1, 44100, seq_sr), 44100), "片段1"),
+     bytes_meta(wav_bytes(resample_poly(mb2, 8000, seq_sr), 8000), "片段2")],
+)
+check("异采样率片段链成立", res_mr["status"] == "verified", res_mr.get("status"))
+if res_mr["status"] == "verified":
+    s1, s2 = res_mr["chain"]["segments"]
+    check("异采样率公共轴取最低 8000Hz", res_mr["sample_rate"] == 8000,
+          str(res_mr["sample_rate"]))
+    check("44.1k 片段起点毫秒正确（1000ms）",
+          abs(s1["start_ms"] - 1000) <= 10, str(s1["start_ms"]))
+    check("8k 片段起点毫秒正确（3200ms）",
+          abs(s2["start_ms"] - 3200) <= 10, str(s2["start_ms"]))
+    check("异采样率空档 ≈1600ms",
+          abs(s2["gap_before_ms"] - 1600) <= 10, str(s2["gap_before_ms"]))
+
+# ---------- 8. 顺序核验 HTTP 接口 ----------
+print("8) 顺序核验 HTTP 接口")
+
+
+def seq_post(ref_data, clip_datas):
+    files = [("reference", ("r.wav", ref_data, "audio/wav"))]
+    for i, d in enumerate(clip_datas):
+        files.append(("clips", (f"s{i + 1}.wav", d, "audio/wav")))
+    # TestClient 接受 (字段名, (文件名, 数据, MIME)) 列表并保留顺序
+    return client.post("/api/sequence", files=files)
+
+
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [wav_bytes(b.copy(), seq_sr) for b in seq_bursts])
+check("顺序核验合法请求 200", r.status_code == 200, f"{r.status_code}: {r.text[:100]}")
+check("HTTP 结果 verified", r.status_code == 200 and r.json()["status"] == "verified")
+
+# 颠倒顺序上传 -> 200 + no_chain（业务判定，不是 HTTP 错误）
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [wav_bytes(seq_bursts[2].copy(), seq_sr),
+              wav_bytes(seq_bursts[1].copy(), seq_sr),
+              wav_bytes(seq_bursts[0].copy(), seq_sr)])
+check("逆序 HTTP 200 + no_chain",
+      r.status_code == 200 and r.json()["status"] == "no_chain",
+      f"{r.status_code}: {r.text[:100]}")
+
+# 只有 1 段 -> 400
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [wav_bytes(seq_bursts[0].copy(), seq_sr)])
+check("片段数量不足 400", r.status_code == 400, f"{r.status_code}")
+
+# 6 段 -> 400
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [wav_bytes(seq_bursts[0].copy(), seq_sr)] * 6)
+check("片段数量超限 400", r.status_code == 400, f"{r.status_code}")
+
+# 缺 clips 字段 -> 400
+r = client.post(
+    "/api/sequence",
+    files=[("reference", ("r.wav", wav_bytes(seq_ref, seq_sr), "audio/wav"))],
+)
+check("缺少 clips 字段 400", r.status_code == 400, f"{r.status_code}")
+
+# 非 WAV / 时长越界 -> 400（沿用同一套校验，标签带序号）
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [b"RIFFxxxx" + b"\0" * 100, wav_bytes(seq_bursts[0].copy(), seq_sr)])
+check("非 WAV 片段 400", r.status_code == 400 and "片段 1" in r.json()["detail"],
+      f"{r.status_code}: {r.text[:100]}")
+r = seq_post(wav_bytes(seq_ref, seq_sr),
+             [wav_bytes(seq_bursts[0].copy(), seq_sr),
+              wav_bytes(lp_noise(0.1, seq_sr, 2000), seq_sr)])
+check("片段时长 0.1s 400", r.status_code == 400 and "片段 2" in r.json()["detail"],
+      f"{r.status_code}: {r.text[:100]}")
+
 print(f"\n结果：{len(PASS)} 通过，{len(FAIL)} 失败")
 if FAIL:
     print("失败项：", FAIL)

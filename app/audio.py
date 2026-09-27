@@ -28,6 +28,10 @@ EPS = 1e-12                    # 数值保护
 MAX_CONTEXT_MS = 2000          # 命中点前后上下文上限（毫秒）
 CONTEXT_STEP_MS = 100          # 上下文步长（毫秒）
 
+# ---- 片段顺序核验约束 ----
+MIN_SEQUENCE_SEGMENTS = 2      # 顺序核验最少片段数
+MAX_SEQUENCE_SEGMENTS = 5      # 顺序核验最多片段数
+
 
 class AudioInputError(ValueError):
     """输入文件不符合要求（格式 / 声道 / 位深 / 采样率 / 时长）。"""
@@ -131,22 +135,41 @@ def normalized_correlation(ref: np.ndarray, clip: np.ndarray) -> np.ndarray:
     return np.clip(scores, -1.0, 1.0)
 
 
-def pick_candidates(scores: np.ndarray, target_rate: int) -> list[int]:
-    """按得分从高到低贪心挑选候选起点，要求彼此间隔 >= 0.25 秒。
+def _greedy_pick(eligible: np.ndarray, scores: np.ndarray, target_rate: int) -> list[int]:
+    """从 eligible 下标中按得分降序贪心挑选，要求彼此间隔 >= 0.25 秒。
 
-    返回所有得分 >= 0.8 且与最高分相差 <= 0.02 的候选下标（按时间升序）。
+    返回下标按时间升序排列。
     """
-    best = float(np.max(scores))
-    eligible = np.flatnonzero(scores >= max(SCORE_THRESHOLD, best - AMBIGUITY_TOLERANCE))
-    if eligible.size == 0:
-        return []
-
     min_gap = int(round(MIN_CANDIDATE_SEPARATION_S * target_rate))
     chosen: list[int] = []
     for idx in eligible[np.argsort(scores[eligible])[::-1]]:
         if all(abs(int(idx) - c) >= min_gap for c in chosen):
             chosen.append(int(idx))
     return sorted(chosen)
+
+
+def pick_candidates(scores: np.ndarray, target_rate: int) -> list[int]:
+    """单片段定位所用候选：得分 >= 0.8 且与最高分相差 <= 0.02。
+
+    按得分从高到低贪心挑选，候选起点彼此间隔 >= 0.25 秒，返回时间升序下标。
+    """
+    best = float(np.max(scores))
+    eligible = np.flatnonzero(scores >= max(SCORE_THRESHOLD, best - AMBIGUITY_TOLERANCE))
+    if eligible.size == 0:
+        return []
+    return _greedy_pick(eligible, scores, target_rate)
+
+
+def pick_all_qualified(scores: np.ndarray, target_rate: int) -> list[int]:
+    """顺序核验所用候选：保留全部得分 >= 0.8 的起点（含较低分候选）。
+
+    同样按得分降序贪心、彼此间隔 >= 0.25 秒（间隔内只保留较高峰），
+    返回时间升序下标。较低分候选也需保留，供跨片段拼链时做全局判断。
+    """
+    eligible = np.flatnonzero(scores >= SCORE_THRESHOLD)
+    if eligible.size == 0:
+        return []
+    return _greedy_pick(eligible, scores, target_rate)
 
 
 def _correlate(ref_meta: dict, clip_meta: dict) -> dict:
@@ -314,3 +337,225 @@ def _describe(meta: dict) -> dict:
         "sample_rate": meta["rate"],
         "channels": meta["channels"],
     }
+
+
+# ---- 片段顺序核验 ----
+
+def _score_segment(ref_meta: dict, clip_meta: dict, ref_cache: dict) -> dict:
+    """计算单段片段在参考录音上的全部合格候选。
+
+    复用定位同一套 WAV 解码、时长校验、重采样与归一化互相关计算；
+    与单片段定位的区别仅在于：保留所有得分 >= 0.8 的候选（含较低分），
+    因为较低分候选可能正是组成全局顺序链的唯一选择。
+    返回 {target_rate, clip_len, status, reason?, best_score?, candidates}，
+    candidates 为 [(start_idx, score), ...]，按起点时间升序。
+    """
+    target_rate = min(ref_meta["rate"], clip_meta["rate"])
+
+    if is_near_silence(ref_meta["signal"]) or is_near_silence(clip_meta["signal"]):
+        return {"target_rate": target_rate, "clip_len": 0,
+                "status": "not_found", "reason": "silence", "candidates": []}
+
+    ref = ref_cache.get(target_rate)
+    if ref is None:
+        ref = prepare(ref_meta, target_rate)
+        ref_cache[target_rate] = ref
+    clip = prepare(clip_meta, target_rate)
+    clip_len = int(clip.size)
+
+    scores = normalized_correlation(ref, clip)
+    best_idx = int(np.argmax(scores))
+    best_score = float(scores[best_idx])
+    if best_score < SCORE_THRESHOLD:
+        return {"target_rate": target_rate, "clip_len": clip_len,
+                "status": "not_found", "reason": "low_score",
+                "best_score": best_score, "candidates": []}
+
+    candidates = [
+        (idx, float(scores[idx]))
+        for idx in pick_all_qualified(scores, target_rate)
+    ]
+    return {"target_rate": target_rate, "clip_len": clip_len,
+            "status": "matched", "best_score": best_score,
+            "candidates": candidates}
+
+
+def _best_two_chains(segments: list[dict]) -> list[tuple[float, tuple]]:
+    """动态规划求总分最高（未舍入得分之和）的完整链，并列时保留不同的次优链。
+
+    段内每个候选保留以它结尾的总分最高的两条「不同链」（完整路径不同即视为
+    不同链）。每段候选数很少（30 秒参考上至多百余个），直接遍历上一段全部
+    候选的至多两条链做合并即可。链要求各段按输入顺序排列：下一段起点不早于
+    上一段终点（互不重叠，允许首尾相接，判定容差 CHAIN_EPS_S）。
+    状态以 (总分, 各段候选序号组成的 tuple) 表示，最终返回总分降序的至多
+    2 条不同完整链。
+    """
+    # 各段候选下标 / 长度换算到公共采样率时分别取整，量化误差最多 1 个公共
+    # 采样点（最低 8 kHz 下约 0.125 ms）；容差取 1 个采样点以正确识别首尾相接。
+    tol = 1.0
+
+    # 第一段：每个候选各有一条链
+    states: dict[int, list[tuple[float, tuple]]] = {
+        cand["u_idx"]: [(cand["score"], (j,))]
+        for j, cand in enumerate(segments[0]["candidates"])
+    }
+
+    for seg_i, seg in enumerate(segments[1:], start=1):
+        prev_items = [(idx, chains) for idx, chains in states.items()]
+        new_states: dict[int, list[tuple[float, tuple]]] = {}
+        for j, cand in enumerate(seg["candidates"]):
+            extended: list[tuple[float, tuple]] = []
+            for prev_idx, chains in prev_items:
+                prev_end = prev_idx + segments[seg_i - 1]["clip_len"]
+                if prev_end <= cand["u_idx"] + tol:
+                    for total, path in chains:
+                        extended.append((total + cand["score"], path + (j,)))
+            if extended:
+                extended.sort(key=lambda t: -t[0])
+                # 来源链路径互不相同，无需再按路径去重
+                new_states[cand["u_idx"]] = extended[:2]
+        states = new_states
+        if not states:
+            return []
+
+    finals = [item for chains in states.values() for item in chains]
+    finals.sort(key=lambda t: -t[0])
+    return finals[:2]
+
+
+def _chain_payload(segments: list[dict], path: tuple[int, ...], total: float,
+                   analysis_rate: int) -> dict:
+    """把一条链（各段候选在本段内的序号、未舍入总分）组装为对外结构（毫秒精度）。
+
+    各段 raw_idx / clip_len_raw 是该段自身分析采样率（raw_rate）下的采样点，
+    毫秒换算必须除以 raw_rate，而不是公共采样率。
+    """
+    items = []
+    for seg_i, cand_j in enumerate(path):
+        cand = segments[seg_i]["candidates"][cand_j]
+        rate = segments[seg_i]["raw_rate"]
+        start_s = cand["raw_idx"] / rate
+        end_s = (cand["raw_idx"] + segments[seg_i]["clip_len_raw"]) / rate
+        start_ms = int(round(start_s * 1000))
+        end_ms = int(round(end_s * 1000))
+        # 相邻空档以未舍入时间计算，避免各自取整后出现 -1 ms
+        gap_value = None
+        if items:
+            gap_value = max(0.0, start_s - items[-1]["_end_s_raw"])
+        items.append({
+            "segment": seg_i + 1,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "start_s": round(start_s, 3),
+            "end_s": round(end_s, 3),
+            "score": round(float(cand["score"]), 4),
+            "gap_before_ms": (None if gap_value is None
+                              else int(round(gap_value * 1000))),
+            "_end_s_raw": end_s,
+        })
+    for item in items:
+        item.pop("_end_s_raw", None)
+    return {
+        "total_score": round(total, 4),
+        "analysis_sample_rate": analysis_rate,
+        "segments": items,
+    }
+
+
+def verify_sequence(ref_meta: dict, clip_metas: list[dict]) -> dict:
+    """片段顺序核验：2～5 段片段按输入顺序在参考录音中拼出互不重叠的完整链。
+
+    - 每段保留全部得分 >= 0.8 的候选（同段候选相隔至少 0.25 秒，按得分降序
+      贪心选取），含较低分候选供全局判断；
+    - 以「各取一处、按输入顺序、互不重叠」为约束，未舍入得分之和最高的完整链
+      为结果；另一条不同链总分相差不超过 0.02 时提示多解；
+    - 无完整链时说明顺序不成立。
+    """
+    # 顺序核验在「参考录音与所有片段的最低公共采样率」下统一比较位置，
+    # 保证不同采样率片段的候选下标处于同一时间轴。
+    analysis_rate = min([ref_meta["rate"]] + [m["rate"] for m in clip_metas])
+    ref_cache: dict = {}
+
+    raw_segments: list[dict] = []
+    segment_info: list[dict] = []
+    for clip_meta in clip_metas:
+        seg = _score_segment(ref_meta, clip_meta, ref_cache)
+        raw_segments.append(seg)
+        segment_info.append(_describe(clip_meta))
+
+    base = {
+        "sample_rate": analysis_rate,
+        "reference": _describe(ref_meta),
+        "segments_info": segment_info,
+        "segment_count": len(clip_metas),
+    }
+
+    failed = [
+        {"segment": i + 1, "reason": seg["reason"],
+         "best_score": round(seg["best_score"], 4)
+         if seg.get("best_score") is not None else None}
+        for i, seg in enumerate(raw_segments)
+        if seg["status"] != "matched"
+    ]
+    if failed:
+        return {
+            **base,
+            "status": "no_chain",
+            "reason": "segment_not_found",
+            "message": "存在得分低于 0.8 或近乎静音的片段，无法核验顺序",
+            "failed_segments": failed,
+        }
+
+    # 拼链用统一时间轴（analysis_rate）：u_idx 为公共轴候选起点、
+    # clip_len 为公共轴片段长度；raw_idx / clip_len_raw 保留本段采样率下
+    # 的原值，供结果精确换算毫秒与回查得分。
+    unified = []
+    for seg in raw_segments:
+        rate = seg["target_rate"]
+        scale = analysis_rate / rate
+        unified.append({
+            "target_rate": analysis_rate,
+            "clip_len": int(round(seg["clip_len"] * scale)),
+            "clip_len_raw": seg["clip_len"],
+            "raw_rate": rate,
+            "candidates": [
+                {"u_idx": int(round(idx * scale)),
+                 "raw_idx": idx,
+                 "score": score}
+                for idx, score in seg["candidates"]
+            ],
+        })
+
+    chains = _best_two_chains(unified)
+    if not chains:
+        return {
+            **base,
+            "status": "no_chain",
+            "reason": "order_not_satisfied",
+            "message": (
+                "各段虽有命中位置，但无法按输入顺序选出互不重叠的完整链，"
+                "顺序不成立"
+            ),
+        }
+
+    best_total, best_path = chains[0]
+    best = _chain_payload(unified, best_path, best_total, analysis_rate)
+    if len(chains) == 2:
+        alt_total, alt_path = chains[1]
+        if best_total - alt_total <= AMBIGUITY_TOLERANCE + 1e-12:
+            return {
+                **base,
+                "status": "ambiguous",
+                "message": (
+                    f"存在多条不同的完整链，且总分相差不超过 "
+                    f"{AMBIGUITY_TOLERANCE:g}（最高 {best_total:.4f}、"
+                    f"另一条 {alt_total:.4f}），顺序链不唯一"
+                ),
+                "best_chain": best,
+                "alternative_chain": _chain_payload(
+                    unified, alt_path, alt_total, analysis_rate),
+            }
+
+    return {**base, "status": "verified",
+            "message": "各段可按输入顺序组成唯一的完整链，顺序成立",
+            "chain": best}

@@ -11,18 +11,21 @@ from .audio import (
     MAX_CLIP_DURATION_S,
     MAX_CONTEXT_MS,
     MAX_REF_DURATION_S,
+    MAX_SEQUENCE_SEGMENTS,
     MIN_CLIP_DURATION_S,
     MIN_REF_DURATION_S,
+    MIN_SEQUENCE_SEGMENTS,
     AudioInputError,
     check_duration,
     export_hit,
     load_wav,
     locate,
+    verify_sequence,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="录音片段定位", version="1.1.0")
+app = FastAPI(title="录音片段定位", version="1.2.0")
 
 
 async def _load_and_check(reference: UploadFile, clip: UploadFile) -> tuple[dict, dict]:
@@ -45,6 +48,50 @@ async def _load_and_check(reference: UploadFile, clip: UploadFile) -> tuple[dict
     return ref_meta, clip_meta
 
 
+async def _load_sequence_inputs(
+    reference: UploadFile, clips: list[UploadFile]
+) -> tuple[dict, list[dict]]:
+    """读取并校验顺序核验上传：一段参考录音 + 按顺序排列的 2～5 段片段。
+
+    沿用 /api/locate 的 WAV 格式与时长校验（片段标签带序号）。
+    """
+    if not clips:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"需上传 {MIN_SEQUENCE_SEGMENTS}～{MAX_SEQUENCE_SEGMENTS} 段片段，"
+                "请以 clips 字段按预期顺序重复上传"
+            ),
+        )
+    if not (MIN_SEQUENCE_SEGMENTS <= len(clips) <= MAX_SEQUENCE_SEGMENTS):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"片段数量为 {len(clips)} 段，要求 "
+                f"{MIN_SEQUENCE_SEGMENTS}～{MAX_SEQUENCE_SEGMENTS} 段"
+            ),
+        )
+
+    try:
+        ref_meta = load_wav(await reference.read(), "参考录音")
+        check_duration(ref_meta, MIN_REF_DURATION_S, MAX_REF_DURATION_S, "参考录音")
+
+        clip_metas: list[dict] = []
+        for i, upload in enumerate(clips, start=1):
+            label = f"片段 {i}"
+            meta = load_wav(await upload.read(), label)
+            check_duration(meta, MIN_CLIP_DURATION_S, MAX_CLIP_DURATION_S, label)
+            if meta["duration"] >= ref_meta["duration"]:
+                raise AudioInputError(
+                    f"{label}时长（{meta['duration']:.3f} 秒）必须小于参考录音时长"
+                    f"（{ref_meta['duration']:.3f} 秒）"
+                )
+            clip_metas.append(meta)
+    except AudioInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return ref_meta, clip_metas
+
+
 def _check_context(label: str, value: int) -> None:
     """命中点前后上下文：0～2000 ms，步长 100 ms。"""
     if value < 0 or value > MAX_CONTEXT_MS or value % CONTEXT_STEP_MS != 0:
@@ -64,6 +111,21 @@ async def locate_clip(
 ):
     ref_meta, clip_meta = await _load_and_check(reference, clip)
     return locate(ref_meta, clip_meta)
+
+
+@app.post("/api/sequence")
+async def verify_clip_sequence(
+    reference: UploadFile = File(..., description="1～30 秒参考录音（WAV）"),
+    clips: list[UploadFile] | None = File(
+        None,
+        description=(
+            "按预期顺序排列的 2～5 段片段（WAV，每段 0.2～5 秒且短于参考录音），"
+            "以同名 clips 字段重复上传，字段顺序即片段顺序"
+        ),
+    ),
+):
+    ref_meta, clip_metas = await _load_sequence_inputs(reference, clips or [])
+    return verify_sequence(ref_meta, clip_metas)
 
 
 @app.post("/api/export")

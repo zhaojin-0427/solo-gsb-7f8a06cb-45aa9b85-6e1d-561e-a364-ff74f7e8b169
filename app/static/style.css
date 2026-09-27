@@ -234,3 +234,90 @@ button:disabled { background: #9ca3af; cursor: not-allowed; }
 @media (max-width: 640px) {
   .inputs { grid-template-columns: 1fr; }
 }
+
+/* ---------- 片段顺序核验 ---------- */
+.panel-title { margin: 0 0 6px; font-size: 18px; }
+.panel-desc { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+
+.seq-clips {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.seq-clip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.seq-clip-row.seq-order { border-color: var(--accent); border-style: solid; }
+.seq-idx {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.seq-clip-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+}
+.seq-clip-body .seq-clip-label { font-weight: 600; display: block; }
+.seq-clip-body .seq-clip-name {
+  color: var(--muted);
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.seq-clip-row input[type="file"] { display: none; }
+.seq-remove {
+  flex: 0 0 auto;
+  background: #fff;
+  color: var(--err);
+  border: 1px solid #fecaca;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+.seq-remove:hover:not(:disabled) { background: #fef2f2; }
+.seq-remove:disabled { color: #d1d5db; border-color: #e5e7eb; }
+
+.seq-row-actions { margin-top: 10px; }
+button.secondary {
+  background: #fff;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 6px 14px;
+  font-size: 13px;
+}
+button.secondary:hover:not(:disabled) { background: #eff6ff; }
+button.secondary:disabled { color: #9ca3af; border-color: #d1d5db; background: #fff; }
+
+.chain-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0 6px;
+  font-size: 13px;
+}
+.chain-table th, .chain-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #eef0f3;
+}
+.chain-table th { color: var(--muted); font-weight: 600; }
+.chain-table .num { font-variant-numeric: tabular-nums; }
+.chain-table tr.seq-row-playable { cursor: pointer; }
+.chain-table tr.seq-row-playable:hover td { background: #f8fafc; }
+
+@media (max-width: 640px) {
+  .seq-clips { grid-template-columns: 1fr; }
+}

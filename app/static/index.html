@@ -81,6 +81,48 @@
         <tbody id="metaBody"></tbody>
       </table>
     </section>
+
+    <section class="panel" id="seqPanel">
+      <h2 class="panel-title">片段顺序核验</h2>
+      <p class="panel-desc">
+        复用上方<strong>参考录音</strong>，另按预期顺序上传 <strong>2～5 段片段</strong>（每段 0.2～5 s WAV），
+        核验它们能否在参考录音中<strong>按该顺序、互不重叠</strong>地各出现一次：
+        每段保留全部得分 ≥ 0.8 的候选（同段候选相隔 ≥ 0.25 s），以未舍入得分之和最高的完整链为结果；
+        无完整链时判定顺序不成立，存在另一条总分相差 ≤ 0.02 的不同链时提示多解。
+      </p>
+      <div class="seq-clips" id="seqClips"></div>
+      <div class="seq-row-actions">
+        <button type="button" id="seqAddBtn" class="secondary">＋ 增加一段</button>
+      </div>
+      <div class="actions">
+        <button id="seqSubmitBtn" disabled>核验顺序</button>
+        <span id="seqStatusText" class="status-text"></span>
+      </div>
+      <div id="seqErrorBanner" class="error-banner hidden"></div>
+    </section>
+
+    <section id="seqResultPanel" class="panel hidden">
+      <div id="seqResultSummary"></div>
+
+      <div class="waveform-block">
+        <div class="waveform-head">
+          <h2>参考波形（顺序标注）</h2>
+          <div class="playback">
+            <button id="seqPlayBtn">▶ 从头试听</button>
+            <audio id="seqAudioEl" preload="auto"></audio>
+          </div>
+        </div>
+        <canvas id="seqWaveCanvas" height="180" title="点击波形可将播放位置跳转到该处"></canvas>
+        <div id="seqWaveError" class="inline-error hidden"></div>
+      </div>
+
+      <table class="meta-table">
+        <thead>
+          <tr><th>#</th><th>时长</th><th>原始采样率</th><th>声道</th></tr>
+        </thead>
+        <tbody id="seqMetaBody"></tbody>
+      </table>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

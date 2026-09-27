@@ -1,0 +1,7 @@
+services:
+  audio-locator:
+    build: .
+    container_name: audio-locator
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

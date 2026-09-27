@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>录音片段定位</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>录音片段定位</h1>
+      <p class="subtitle">
+        上传 <strong>1～30 秒</strong> 参考录音与 <strong>0.2～5 秒</strong> 待找片段，
+        使用归一化互相关（FFT 加速）在参考录音中定位片段起点。<br />
+        支持单声道/双声道、8～48 kHz、16 位 PCM WAV；允许不同采样率与整体音量。
+      </p>
+    </header>
+
+    <section class="panel">
+      <div class="inputs">
+        <label class="file-input">
+          <span class="file-label">参考录音（1～30 s）</span>
+          <input type="file" id="refInput" accept="audio/wav,audio/wave,audio/x-wav" />
+          <span class="file-name" id="refName">未选择文件</span>
+        </label>
+        <label class="file-input">
+          <span class="file-label">待找片段（0.2～5 s）</span>
+          <input type="file" id="clipInput" accept="audio/wav,audio/wave,audio/x-wav" />
+          <span class="file-name" id="clipName">未选择文件</span>
+        </label>
+      </div>
+      <div class="actions">
+        <button id="submitBtn" disabled>上传并定位</button>
+        <span id="statusText" class="status-text"></span>
+      </div>
+      <div id="errorBanner" class="error-banner hidden"></div>
+    </section>
+
+    <section id="resultPanel" class="panel hidden">
+      <div id="resultSummary"></div>
+
+      <div id="exportBlock" class="export-block hidden">
+        <div class="export-head">
+          <h2>导出命中片段</h2>
+          <span class="export-hint">按原始参考 WAV 的采样率、声道与 16 位 PCM 精确裁剪；超出边界自动收紧。</span>
+        </div>
+        <div class="export-controls">
+          <label class="export-field">
+            命中点前
+            <input type="number" id="preMs" min="0" max="2000" step="100" value="0" />
+            毫秒（0～2000，步长 100）
+          </label>
+          <label class="export-field">
+            命中点后
+            <input type="number" id="postMs" min="0" max="2000" step="100" value="0" />
+            毫秒（0～2000，步长 100）
+          </label>
+          <button id="exportBtn">导出 WAV</button>
+        </div>
+        <div id="exportMsg" class="export-msg hidden"></div>
+      </div>
+
+      <div class="waveform-block">
+        <div class="waveform-head">
+          <h2>参考波形</h2>
+          <div class="playback">
+            <button id="playHitBtn">▶ 从命中处试听</button>
+            <button id="playFullBtn">从头播放</button>
+            <audio id="audioEl" preload="auto"></audio>
+          </div>
+        </div>
+        <canvas id="waveCanvas" height="180" title="点击波形可将播放位置跳转到该处"></canvas>
+        <div id="waveError" class="inline-error hidden"></div>
+      </div>
+
+      <table class="meta-table">
+        <thead>
+          <tr><th>文件</th><th>时长</th><th>原始采样率</th><th>声道</th></tr>
+        </thead>
+        <tbody id="metaBody"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

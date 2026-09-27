@@ -234,3 +234,73 @@ button:disabled { background: #9ca3af; cursor: not-allowed; }
 @media (max-width: 640px) {
   .inputs { grid-template-columns: 1fr; }
 }
+
+/* ---------- 片段顺序核验 ---------- */
+.panel-title { margin: 0 0 8px; font-size: 20px; }
+.panel-desc { margin: 0 0 16px; color: var(--muted); font-size: 13.5px; }
+
+.seq-inputs { margin-bottom: 12px; }
+
+.seq-clips-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 6px 0 8px;
+}
+
+.seq-clip-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.seq-clip-slot {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+.seq-clip-file { flex: 1; }
+
+.mini-btn {
+  background: #fff;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.mini-btn:hover:not(:disabled) { background: #eff6ff; }
+.mini-btn:disabled { color: #9ca3af; border-color: #d1d5db; background: #fff; }
+.remove-btn { color: var(--err); border-color: #fca5a5; align-self: center; }
+.remove-btn:hover:not(:disabled) { background: #fef2f2; }
+
+.seq-result { margin-top: 18px; }
+.seq-chain-block {
+  margin: 10px 0 16px;
+  padding: 12px 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+.seq-chain-block h3 { font-size: 15px; margin: 0 0 8px; }
+.seq-alt-block {
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed #d1d5db;
+}
+.alt-row td { color: var(--muted); }
+
+.seg-badge {
+  display: inline-block;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}

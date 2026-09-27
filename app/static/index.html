@@ -81,6 +81,77 @@
         <tbody id="metaBody"></tbody>
       </table>
     </section>
+
+    <section class="panel" id="seqPanel">
+      <h2 class="panel-title">片段顺序核验</h2>
+      <p class="panel-desc">
+        上传一段<strong>参考录音</strong>与按<strong>预期顺序</strong>排列的
+        <strong>2～5 段</strong>片段（格式与上面相同）。
+        每段保留所有相关得分 ≥ 0.8 且彼此相隔 ≥ 0.25 秒的起点，
+        再从「各取一处、按序排列、互不重叠」的完整链中取未舍入得分之和最高者；
+        无完整链即判定顺序不成立，存在总分相差 ≤ 0.02 的另一条链则提示多解。
+      </p>
+      <div class="seq-inputs">
+        <label class="file-input">
+          <span class="file-label">参考录音（1～30 s）</span>
+          <input type="file" id="seqRefInput" accept="audio/wav,audio/wave,audio/x-wav" />
+          <span class="file-name" id="seqRefName">未选择文件</span>
+        </label>
+      </div>
+      <div class="seq-clips-head">
+        <span class="file-label">按预期顺序排列的片段（2～5 段，每段 0.2～5 s）</span>
+        <button type="button" id="seqAddBtn" class="mini-btn">＋ 添加一段</button>
+      </div>
+      <div id="seqClipList" class="seq-clip-list"></div>
+      <div class="actions">
+        <button id="seqSubmitBtn" disabled>上传并核验顺序</button>
+        <span id="seqStatusText" class="status-text"></span>
+      </div>
+      <div id="seqErrorBanner" class="error-banner hidden"></div>
+
+      <div id="seqResultPanel" class="seq-result hidden">
+        <div id="seqSummary"></div>
+
+        <div id="seqChainBlock" class="seq-chain-block hidden">
+          <h3>核验链（各段起止与相邻空档）</h3>
+          <table class="meta-table">
+            <thead>
+              <tr><th>段次</th><th>起点</th><th>终点</th><th>相关得分</th><th>与上一段空档</th></tr>
+            </thead>
+            <tbody id="seqChainBody"></tbody>
+          </table>
+          <div id="seqAltBlock" class="seq-alt-block hidden">
+            <h3>另一条链（多解）</h3>
+            <table class="meta-table">
+              <thead>
+                <tr><th>段次</th><th>起点</th><th>终点</th><th>相关得分</th><th>与上一段空档</th></tr>
+              </thead>
+              <tbody id="seqAltBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="waveform-block">
+          <div class="waveform-head">
+            <h2>参考波形</h2>
+            <div class="playback">
+              <button id="seqPlayFirstBtn" disabled>▶ 从第一段试听</button>
+              <button id="seqPlayFullBtn" disabled>从头播放</button>
+              <audio id="seqAudioEl" preload="auto"></audio>
+            </div>
+          </div>
+          <canvas id="seqWaveCanvas" height="180" title="点击波形可将播放位置跳转到该处"></canvas>
+          <div id="seqWaveError" class="inline-error hidden"></div>
+        </div>
+
+        <table class="meta-table">
+          <thead>
+            <tr><th>文件</th><th>时长</th><th>原始采样率</th><th>声道</th></tr>
+          </thead>
+          <tbody id="seqMetaBody"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

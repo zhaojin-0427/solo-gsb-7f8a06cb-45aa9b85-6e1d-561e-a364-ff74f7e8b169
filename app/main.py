@@ -11,18 +11,21 @@ from .audio import (
     MAX_CLIP_DURATION_S,
     MAX_CONTEXT_MS,
     MAX_REF_DURATION_S,
+    MAX_SEGMENT_COUNT,
     MIN_CLIP_DURATION_S,
     MIN_REF_DURATION_S,
+    MIN_SEGMENT_COUNT,
     AudioInputError,
     check_duration,
     export_hit,
     load_wav,
     locate,
+    verify_sequence,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="录音片段定位", version="1.1.0")
+app = FastAPI(title="录音片段定位", version="1.2.0")
 
 
 async def _load_and_check(reference: UploadFile, clip: UploadFile) -> tuple[dict, dict]:
@@ -94,12 +97,50 @@ async def export_clip(
     )
 
 
+@app.post("/api/sequence")
+async def check_sequence(
+    reference: UploadFile = File(..., description="1～30 秒参考录音（WAV）"),
+    clips: list[UploadFile] = File(..., description="按预期顺序排列的 2～5 段片段（WAV）"),
+):
+    """片段顺序核验：参考录音 + 按预期顺序排列的 2～5 段片段。"""
+    if not (MIN_SEGMENT_COUNT <= len(clips) <= MAX_SEGMENT_COUNT):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"片段数量为 {len(clips)} 段，需上传 {MIN_SEGMENT_COUNT}～"
+                f"{MAX_SEGMENT_COUNT} 段并按预期顺序排列"
+            ),
+        )
+
+    try:
+        ref_meta = load_wav(await reference.read(), "参考录音")
+        check_duration(ref_meta, MIN_REF_DURATION_S, MAX_REF_DURATION_S, "参考录音")
+
+        clip_metas = []
+        for i, upload in enumerate(clips, start=1):
+            label = f"第 {i} 段片段"
+            meta = load_wav(await upload.read(), label)
+            check_duration(meta, MIN_CLIP_DURATION_S, MAX_CLIP_DURATION_S, label)
+            if meta["duration"] >= ref_meta["duration"]:
+                raise AudioInputError(
+                    f"{label}时长（{meta['duration']:.3f} 秒）必须小于参考录音时长"
+                    f"（{ref_meta['duration']:.3f} 秒）"
+                )
+            clip_metas.append(meta)
+    except AudioInputError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return verify_sequence(ref_meta, clip_metas)
+
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
 
 
 @app.get("/", include_in_schema=False)
+async def index():
+    return FileResponse(STATIC_DIR / "index.html")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
 

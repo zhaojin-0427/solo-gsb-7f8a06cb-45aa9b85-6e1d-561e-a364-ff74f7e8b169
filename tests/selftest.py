@@ -14,7 +14,7 @@ from scipy.signal import firwin, lfilter, resample_poly
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.audio import locate  # noqa: E402
+from app.audio import locate, verify_sequence  # noqa: E402
 from app.main import app  # noqa: E402
 
 rng = np.random.default_rng(20260925)
@@ -322,6 +322,165 @@ check("非法 post_ms=2001 返回 400", r_bad.status_code == 400)
 # 非 WAV 输入同样走 400
 r_bad = export(0, 0, ref_data=b"RIFFxxxx" + b"\0" * 100)
 check("导出非 WAV 返回 400", r_bad.status_code == 400)
+
+# ---------- 7. 片段顺序核验：唯一链 ----------
+print("7) 片段顺序核验：唯一链")
+seq_rate = 16000
+seq_ref = lp_noise(10.0, seq_rate, cutoff=3000) * 0.05
+# 三段按预期顺序插入：1.0s 起 0.6s、3.5s 起 0.5s、6.0s 起 0.7s
+seq_specs = [(1.0, 0.6), (3.5, 0.5), (6.0, 0.7)]
+seq_bursts = []
+for p, d in seq_specs:
+    b = rng.standard_normal(int(d * seq_rate))
+    b = lfilter(firwin(101, 0.5), 1.0, b) * 0.9
+    seq_bursts.append(b)
+    i0 = int(p * seq_rate)
+    seq_ref[i0:i0 + b.size] += b
+seq_ref_wav = wav_bytes(seq_ref, seq_rate)
+seq_clip_wavs = []
+for k, (p, d) in enumerate(seq_specs):
+    i0, i1 = int(p * seq_rate), int((p + d) * seq_rate)
+    c = seq_ref[i0:i1].copy()
+    # 第 2 段用不同采样率 + 小音量 + 直流偏移，验证沿用现有归一化口径
+    if k == 1:
+        c = resample_poly(c, 22050, seq_rate) * 0.3 + 0.05
+        seq_clip_wavs.append(wav_bytes(c, 22050))
+    else:
+        seq_clip_wavs.append(wav_bytes(c, seq_rate))
+
+res_seq = verify_sequence(
+    bytes_meta(seq_ref_wav, "参考录音"),
+    [bytes_meta(w, f"第 {i + 1} 段片段") for i, w in enumerate(seq_clip_wavs)],
+)
+check("核验状态 verified", res_seq["status"] == "verified", res_seq.get("status"))
+check("核验唯一（无多解）", res_seq["multiple_solutions"] is False)
+starts = [s["start_ms"] for s in res_seq["chain"]["segments"]]
+ends = [s["end_ms"] for s in res_seq["chain"]["segments"]]
+check("各段起点毫秒为 1000/3500/6000", starts == [1000, 3500, 6000], str(starts))
+check("各段终点毫秒为 1600/4000/6700", ends == [1600, 4000, 6700], str(ends))
+# 空档：(3.5-1.6)=1.9s、(6.0-4.0)=2.0s
+check("相邻空档为 1900/2000 ms",
+      res_seq["chain"]["gaps_ms"] == [1900, 2000],
+      str(res_seq["chain"]["gaps_ms"]))
+check("链总得分 ≈ 3（各段高分）",
+      abs(res_seq["chain"]["total_score"] - 3.0) < 0.1,
+      str(res_seq["chain"]["total_score"]))
+check("每段候选数 >= 1",
+      all(len(r["candidates"]) >= 1 for r in res_seq["segments_report"]))
+
+# 两段紧邻（首尾相接，空档 0）也算互不重叠的完整链
+touch_ref = lp_noise(6.0, seq_rate, cutoff=3000) * 0.05
+t_b1 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.5 * seq_rate))) * 0.9
+t_b2 = lfilter(firwin(101, 0.5), 1.0, rng.standard_normal(int(0.6 * seq_rate))) * 0.9
+touch_ref[int(2.0 * seq_rate):int(2.0 * seq_rate) + t_b1.size] += t_b1
+touch_ref[int(2.5 * seq_rate):int(2.5 * seq_rate) + t_b2.size] += t_b2
+t_wav = wav_bytes(touch_ref, seq_rate)
+t_c1 = wav_bytes(touch_ref[int(2.0 * seq_rate):int(2.5 * seq_rate)].copy(), seq_rate)
+t_c2 = wav_bytes(touch_ref[int(2.5 * seq_rate):int(3.1 * seq_rate)].copy(), seq_rate)
+res_t = verify_sequence(bytes_meta(t_wav, "参考录音"),
+                        [bytes_meta(t_c1, "第 1 段片段"),
+                         bytes_meta(t_c2, "第 2 段片段")])
+check("首尾相接空档 0 仍成立",
+      res_t["status"] == "verified" and res_t["chain"]["gaps_ms"] == [0],
+      str(res_t.get("status")) + " " + str(res_t.get("chain", {}).get("gaps_ms")))
+
+# ---------- 8. 顺序核验：顺序不成立 ----------
+print("8) 片段顺序核验：顺序不成立")
+# 把第 3 段与第 1 段的上传顺序对调：链需按 6s -> 1s 排列，不存在
+res_bad_order = verify_sequence(
+    bytes_meta(seq_ref_wav, "参考录音"),
+    [bytes_meta(seq_clip_wavs[2], "第 1 段片段"),
+     bytes_meta(seq_clip_wavs[0], "第 2 段片段")],
+)
+check("逆序返回 sequence_not_established / overlap",
+      res_bad_order["status"] == "sequence_not_established"
+      and res_bad_order["reason"] == "overlap",
+      str(res_bad_order.get("status")))
+
+# 某段在参考中不存在（低分）
+foreign_seg = wav_bytes(lp_noise(0.6, seq_rate, 3000), seq_rate)
+res_foreign = verify_sequence(
+    bytes_meta(seq_ref_wav, "参考录音"),
+    [bytes_meta(seq_clip_wavs[0], "第 1 段片段"),
+     bytes_meta(foreign_seg, "第 2 段片段")],
+)
+check("含无关片段返回 segment_not_found",
+      res_foreign["status"] == "sequence_not_established"
+      and res_foreign["reason"] == "segment_not_found",
+      str(res_foreign.get("status")))
+
+# 近乎静音片段
+silent_seg = wav_bytes(np.zeros(int(0.6 * seq_rate)) + 1e-4, seq_rate)
+res_silent = verify_sequence(
+    bytes_meta(seq_ref_wav, "参考录音"),
+    [bytes_meta(seq_clip_wavs[0], "第 1 段片段"),
+     bytes_meta(silent_seg, "第 2 段片段")],
+)
+check("静音片段返回 silence",
+      res_silent["status"] == "sequence_not_established"
+      and res_silent["reason"] == "silence",
+      str(res_silent.get("status")))
+
+# ---------- 9. 顺序核验：多解 ----------
+print("9) 片段顺序核验：多解提示")
+multi_ref = lp_noise(10.0, seq_rate, cutoff=3000) * 0.05
+m_burst = lfilter(firwin(101, 0.5), 1.0,
+                  rng.standard_normal(int(0.5 * seq_rate))) * 0.9
+for pos in (1.0, 2.0):  # 第一段内容出现两次（间隔 1s > 0.25s）
+    p = int(pos * seq_rate)
+    multi_ref[p:p + m_burst.size] += m_burst
+m_burst2 = lfilter(firwin(101, 0.5), 1.0,
+                   rng.standard_normal(int(0.6 * seq_rate))) * 0.9
+p2 = int(4.0 * seq_rate)
+multi_ref[p2:p2 + m_burst2.size] += m_burst2
+multi_ref_wav = wav_bytes(multi_ref, seq_rate)
+m_clip1 = wav_bytes(multi_ref[int(1.0 * seq_rate):int(1.5 * seq_rate)].copy(), seq_rate)
+m_clip2 = wav_bytes(multi_ref[int(4.0 * seq_rate):int(4.6 * seq_rate)].copy(), seq_rate)
+res_multi = verify_sequence(
+    bytes_meta(multi_ref_wav, "参考录音"),
+    [bytes_meta(m_clip1, "第 1 段片段"), bytes_meta(m_clip2, "第 2 段片段")],
+)
+check("多解仍判 verified", res_multi["status"] == "verified",
+      res_multi.get("status"))
+check("multiple_solutions 为真", res_multi["multiple_solutions"] is True)
+check("给出另一条链", "alternative_chain" in res_multi)
+if "alternative_chain" in res_multi:
+    diff = (res_multi["chain"]["total_score"]
+            - res_multi["alternative_chain"]["total_score"])
+    check("两链总分差 <= 0.02", 0 <= diff <= 0.02, f"diff={diff:.4f}")
+    b1 = res_multi["chain"]["segments"][0]["start_ms"]
+    a1 = res_multi["alternative_chain"]["segments"][0]["start_ms"]
+    check("两条链确实不同（第 1 段起点不同）", b1 != a1, f"{b1} vs {a1}")
+
+# ---------- 10. 顺序核验 HTTP 接口 ----------
+print("10) 片段顺序核验 HTTP 接口")
+
+
+def seq_post(ref_data, clip_datas):
+    files = [("reference", ("r.wav", ref_data, "audio/wav"))]
+    files += [("clips", (f"s{i}.wav", d, "audio/wav")) for i, d in enumerate(clip_datas)]
+    return client.post("/api/sequence", files=files)
+
+
+r = seq_post(seq_ref_wav, seq_clip_wavs)
+check("核验请求 200", r.status_code == 200, f"{r.status_code}: {r.text[:100]}")
+check("首页含顺序核验模块", "片段顺序核验" in client.get("/").text)
+
+r1 = seq_post(seq_ref_wav, seq_clip_wavs[:1])
+check("仅 1 段返回 400", r1.status_code == 400, str(r1.status_code))
+r6 = seq_post(seq_ref_wav, seq_clip_wavs[:2] * 3)
+check("6 段返回 400", r6.status_code == 400, str(r6.status_code))
+r_badwav = seq_post(b"RIFFxxxx" + b"\0" * 100, seq_clip_wavs[:2])
+check("非 WAV 参考返回 400", r_badwav.status_code == 400)
+r_empty = seq_post(seq_ref_wav, [b"", seq_clip_wavs[0]])
+check("空片段返回 400", r_empty.status_code == 400)
+r_long = seq_post(seq_ref_wav, [seq_clip_wavs[0],
+                                wav_bytes(lp_noise(6.0, seq_rate, 3000), seq_rate)])
+check("6 秒片段返回 400", r_long.status_code == 400)
+r_multi_http = seq_post(multi_ref_wav, [m_clip1, m_clip2])
+check("多解场景 HTTP 200", r_multi_http.status_code == 200
+      and r_multi_http.json()["multiple_solutions"] is True,
+      str(r_multi_http.status_code))
 
 print(f"\n结果：{len(PASS)} 通过，{len(FAIL)} 失败")
 if FAIL:

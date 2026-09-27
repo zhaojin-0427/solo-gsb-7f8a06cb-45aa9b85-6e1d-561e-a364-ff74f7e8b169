@@ -413,3 +413,432 @@ exportBtn.addEventListener("click", async () => {
     exportBtn.disabled = false;
   }
 });
+
+/* =========================================================================
+   片段顺序核验
+   ========================================================================= */
+
+const SEQ_COLORS = ["#2563eb", "#16a34a", "#9333ea", "#ea580c", "#0891b2"];
+
+const seqRefInput = $("seqRefInput");
+const seqClipList = $("seqClipList");
+const seqAddBtn = $("seqAddBtn");
+const seqSubmitBtn = $("seqSubmitBtn");
+const seqStatusText = $("seqStatusText");
+const seqErrorBanner = $("seqErrorBanner");
+const seqRefName = $("seqRefName");
+const seqResultPanel = $("seqResultPanel");
+const seqSummary = $("seqSummary");
+const seqChainBlock = $("seqChainBlock");
+const seqChainBody = $("seqChainBody");
+const seqAltBlock = $("seqAltBlock");
+const seqAltBody = $("seqAltBody");
+const seqMetaBody = $("seqMetaBody");
+const seqWaveCanvas = $("seqWaveCanvas");
+const seqWaveError = $("seqWaveError");
+const seqAudioEl = $("seqAudioEl");
+const seqPlayFirstBtn = $("seqPlayFirstBtn");
+const seqPlayFullBtn = $("seqPlayFullBtn");
+
+let seqRefFile = null;
+let seqClipFiles = []; // 长度随片段槽变化，元素为 File | null
+let seqObjectUrl = null;
+let seqResult = null;
+let seqWaveState = null; // { samples, duration, regions, peaks, peaksWidth }
+
+function showSeqError(msg) {
+  seqErrorBanner.textContent = msg;
+  seqErrorBanner.classList.remove("hidden");
+}
+
+function clearSeqError() {
+  seqErrorBanner.classList.add("hidden");
+  seqErrorBanner.textContent = "";
+}
+
+function refreshSeqCanSubmit() {
+  seqSubmitBtn.disabled =
+    !seqRefFile ||
+    seqClipFiles.length < 2 ||
+    seqClipFiles.some((f) => !f);
+  seqAddBtn.disabled = seqClipFiles.length >= 5;
+}
+
+function renderClipSlots() {
+  seqClipList.innerHTML = "";
+  seqClipFiles.forEach((file, i) => {
+    const li = document.createElement("li");
+    li.className = "seq-clip-slot";
+
+    const label = document.createElement("label");
+    label.className = "file-input seq-clip-file";
+    const span = document.createElement("span");
+    span.className = "file-label";
+    span.textContent = `第 ${i + 1} 段（按预期顺序）`;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "audio/wav,audio/wave,audio/x-wav";
+    const name = document.createElement("span");
+    name.className = "file-name";
+    name.textContent = file
+      ? `${file.name}（${(file.size / 1024).toFixed(1)} KB）`
+      : "未选择文件";
+    input.addEventListener("change", () => {
+      seqClipFiles[i] = input.files[0] || null;
+      renderClipSlots();
+      refreshSeqCanSubmit();
+    });
+    label.append(span, input, name);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "mini-btn remove-btn";
+    removeBtn.textContent = "移除";
+    removeBtn.disabled = seqClipFiles.length <= 2;
+    removeBtn.addEventListener("click", () => {
+      seqClipFiles.splice(i, 1);
+      renderClipSlots();
+      refreshSeqCanSubmit();
+    });
+
+    li.append(label, removeBtn);
+    seqClipList.appendChild(li);
+  });
+}
+
+seqAddBtn.addEventListener("click", () => {
+  if (seqClipFiles.length >= 5) return;
+  seqClipFiles.push(null);
+  renderClipSlots();
+  refreshSeqCanSubmit();
+});
+
+seqRefInput.addEventListener("change", () => {
+  seqRefFile = seqRefInput.files[0] || null;
+  seqRefName.textContent = seqRefFile
+    ? `${seqRefFile.name}（${(seqRefFile.size / 1024).toFixed(1)} KB）`
+    : "未选择文件";
+  refreshSeqCanSubmit();
+});
+
+// 初始两段
+seqClipFiles = [null, null];
+renderClipSlots();
+refreshSeqCanSubmit();
+
+function setSeqBusy(busy) {
+  seqSubmitBtn.disabled = busy;
+  seqAddBtn.disabled = busy || seqClipFiles.length >= 5;
+  seqStatusText.textContent = busy ? "正在上传并核验…" : "";
+}
+
+function seqGapCell(gaps, i) {
+  return i === 0 ? "—" : `${gaps[i - 1]} ms`;
+}
+
+function fillChainBody(tbody, chain, alt) {
+  tbody.innerHTML = chain.segments
+    .map((s, i) => {
+      const color = SEQ_COLORS[i % SEQ_COLORS.length];
+      return `
+        <tr${alt ? ' class="alt-row"' : ""}>
+          <td><span class="seg-badge" style="background:${color}">${s.segment}</span></td>
+          <td>${s.start_ms} ms（${fmtTime(s.start_s)}）</td>
+          <td>${s.end_ms} ms（${fmtTime(s.end_s)}）</td>
+          <td>${s.score.toFixed(4)}</td>
+          <td>${seqGapCell(chain.gaps_ms, i)}</td>
+        </tr>`;
+    })
+    .join("");
+}
+
+function renderSeqResult(data) {
+  seqResult = data;
+  seqResultPanel.classList.remove("hidden");
+
+  const regions = []; // 波形标注：{start_s,end_s,color,kind,label}
+  let html = "";
+
+  if (data.status === "verified") {
+    seqChainBlock.classList.remove("hidden");
+    fillChainBody(seqChainBody, data.chain, false);
+
+    const unique = !data.multiple_solutions;
+    const tag = unique
+      ? '<span class="tag ok">顺序成立 · 核验唯一</span>'
+      : '<span class="tag warn">顺序成立 · 存在多解</span>';
+    html = `
+      <div class="result-status">${tag}</div>
+      <p class="result-detail">
+        共 ${data.chain.segments.length} 段，按输入顺序排列且互不重叠；
+        链总得分（未舍入之和）<span class="num">${data.total_score.toFixed(4)}</span>。
+      </p>
+      <p class="result-detail">${data.message}</p>`;
+
+    data.chain.segments.forEach((s, i) => {
+      regions.push({
+        start_s: s.start_s,
+        end_s: s.end_s,
+        color: SEQ_COLORS[i % SEQ_COLORS.length],
+        kind: "chain",
+        label: String(i + 1),
+      });
+    });
+
+    if (data.multiple_solutions && data.alternative_chain) {
+      seqAltBlock.classList.remove("hidden");
+      fillChainBody(seqAltBody, data.alternative_chain, true);
+      data.alternative_chain.segments.forEach((s, i) => {
+        regions.push({
+          start_s: s.start_s,
+          end_s: s.end_s,
+          color: SEQ_COLORS[i % SEQ_COLORS.length],
+          kind: "alt",
+          label: `${i + 1}′`,
+        });
+      });
+    } else {
+      seqAltBlock.classList.add("hidden");
+      seqAltBody.innerHTML = "";
+    }
+    seqPlayFirstBtn.disabled = false;
+    seqPlayFullBtn.disabled = false;
+  } else {
+    seqChainBlock.classList.add("hidden");
+    seqAltBlock.classList.add("hidden");
+    html = `
+      <div class="result-status"><span class="tag err">顺序不成立</span></div>
+      <p class="result-detail">${data.message}</p>`;
+    seqPlayFirstBtn.disabled = true;
+    seqPlayFullBtn.disabled = true;
+
+    // 顺序不成立：把各段全部候选以琥珀色标在波形上，供人工判断
+    (data.segments_report || []).forEach((r, i) => {
+      (r.candidates || []).forEach((c) => {
+        regions.push({
+          start_s: c.start_s,
+          end_s: c.end_s,
+          color: "#b45309",
+          kind: "cand",
+          label: String(i + 1),
+        });
+      });
+    });
+  }
+
+  seqSummary.innerHTML = html;
+
+  seqMetaBody.innerHTML = `
+    <tr>
+      <td>参考录音</td>
+      <td>${data.reference.duration_s.toFixed(3)} s</td>
+      <td>${data.reference.sample_rate} Hz</td>
+      <td>${data.reference.channels === 2 ? "双声道" : "单声道"}</td>
+    </tr>` +
+    data.clips
+      .map(
+        (c, i) => `
+    <tr>
+      <td><span class="seg-badge" style="background:${SEQ_COLORS[i % SEQ_COLORS.length]}">${i + 1}</span> 第 ${i + 1} 段</td>
+      <td>${c.duration_s.toFixed(3)} s</td>
+      <td>${c.sample_rate} Hz</td>
+      <td>${c.channels === 2 ? "双声道" : "单声道"}</td>
+    </tr>`
+      )
+      .join("") +
+    `
+    <tr>
+      <td>分析用采样率</td>
+      <td colspan="3">${data.sample_rate} Hz（统一重采样后）</td>
+    </tr>`;
+
+  return regions;
+}
+
+/* ---------- 顺序核验波形 ---------- */
+
+async function prepareSeqWaveform(regions) {
+  seqWaveError.classList.add("hidden");
+  seqWaveState = null;
+
+  if (seqObjectUrl) URL.revokeObjectURL(seqObjectUrl);
+  seqObjectUrl = URL.createObjectURL(seqRefFile);
+  seqAudioEl.src = seqObjectUrl;
+
+  try {
+    const buf = await seqRefFile.arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuf = await ctx.decodeAudioData(buf);
+    ctx.close();
+    seqWaveState = {
+      samples: audioBuf.getChannelData(0),
+      duration: audioBuf.duration,
+      regions,
+      peaks: null,
+      peaksWidth: 0,
+    };
+    drawSeqWaveform();
+  } catch (err) {
+    seqWaveError.textContent = "浏览器无法解码参考录音，波形与试听不可用。";
+    seqWaveError.classList.remove("hidden");
+  }
+}
+
+function drawSeqWaveform() {
+  if (!seqWaveState) return;
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = seqWaveCanvas.clientWidth || seqWaveCanvas.parentElement.clientWidth;
+  const cssHeight = 180;
+  seqWaveCanvas.width = Math.round(cssWidth * dpr);
+  seqWaveCanvas.height = Math.round(cssHeight * dpr);
+
+  const ctx = seqWaveCanvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const W = cssWidth;
+  const H = cssHeight;
+  const mid = H / 2;
+
+  if (!seqWaveState.peaks || seqWaveState.peaksWidth !== W) {
+    seqWaveState.peaks = computePeaks(seqWaveState.samples, Math.max(1, Math.round(W)));
+    seqWaveState.peaksWidth = W;
+  }
+  const { peaks, duration, regions } = seqWaveState;
+  const toX = (t) => (t / duration) * W;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // 候选（顺序不成立时的琥珀色标注）先画在底层
+  regions
+    .filter((r) => r.kind === "cand")
+    .forEach((r) => {
+      const x0 = toX(r.start_s);
+      const x1 = toX(r.end_s);
+      ctx.fillStyle = "rgba(180, 83, 9, 0.12)";
+      ctx.fillRect(x0, 0, Math.max(1, x1 - x0), H);
+    });
+
+  // 核验链各段：彩色半透明填充
+  regions
+    .filter((r) => r.kind === "chain")
+    .forEach((r) => {
+      const x0 = toX(r.start_s);
+      const x1 = toX(r.end_s);
+      ctx.fillStyle = r.color + "26"; // hex alpha ≈ 0.15
+      ctx.fillRect(x0, 0, Math.max(1, x1 - x0), H);
+    });
+
+  // 波形
+  ctx.strokeStyle = "#475569";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < peaks.length; x++) {
+    const y = peaks[x] * (mid - 4);
+    ctx.moveTo(x + 0.5, mid - y);
+    ctx.lineTo(x + 0.5, mid + y);
+  }
+  ctx.stroke();
+
+  // 中线
+  ctx.strokeStyle = "rgba(0, 0, 0, 0.08)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(W, mid);
+  ctx.stroke();
+
+  // 区间边界 + 段次标注
+  regions.forEach((r) => {
+    const x0 = toX(r.start_s);
+    const x1 = toX(r.end_s);
+    if (r.kind === "alt") {
+      // 多解的另一条链：同色虚线，仅在起点标注
+      ctx.strokeStyle = r.color;
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      [x0, x1].forEach((x) => {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+      });
+      ctx.setLineDash([]);
+      ctx.fillStyle = r.color;
+      ctx.font = "bold 11px sans-serif";
+      ctx.fillText(r.label, x0 + 3, H - 6);
+      return;
+    }
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = r.kind === "chain" ? 2 : 1.2;
+    [x0, x1].forEach((x) => {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    });
+    if (r.kind === "chain") {
+      ctx.fillStyle = r.color;
+      ctx.font = "bold 12px sans-serif";
+      ctx.fillText(r.label, x0 + 4, 14);
+    }
+  });
+
+  // 播放头
+  if (!seqAudioEl.paused && seqAudioEl.duration) {
+    const px = (seqAudioEl.currentTime / seqAudioEl.duration) * W;
+    ctx.strokeStyle = "#dc2626";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, H);
+    ctx.stroke();
+  }
+}
+
+window.addEventListener("resize", drawSeqWaveform);
+seqAudioEl.addEventListener("timeupdate", drawSeqWaveform);
+seqAudioEl.addEventListener("ended", drawSeqWaveform);
+
+seqWaveCanvas.addEventListener("click", (e) => {
+  if (!seqWaveState || !seqAudioEl.duration) return;
+  const rect = seqWaveCanvas.getBoundingClientRect();
+  const ratio = (e.clientX - rect.left) / rect.width;
+  seqAudioEl.currentTime = ratio * seqAudioEl.duration;
+  drawSeqWaveform();
+});
+
+seqSubmitBtn.addEventListener("click", async () => {
+  clearSeqError();
+  seqResultPanel.classList.add("hidden");
+  setSeqBusy(true);
+  try {
+    const form = new FormData();
+    form.append("reference", seqRefFile);
+    seqClipFiles.forEach((f) => form.append("clips", f));
+
+    const resp = await fetch("/api/sequence", { method: "POST", body: form });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `请求失败（HTTP ${resp.status}）`);
+    }
+    const regions = renderSeqResult(data);
+    await prepareSeqWaveform(regions);
+  } catch (err) {
+    showSeqError(err.message || String(err));
+  } finally {
+    setSeqBusy(false);
+    refreshSeqCanSubmit();
+  }
+});
+
+seqPlayFullBtn.addEventListener("click", () => {
+  if (!seqAudioEl.src) return;
+  seqAudioEl.currentTime = 0;
+  seqAudioEl.play().catch(() => {});
+});
+
+seqPlayFirstBtn.addEventListener("click", () => {
+  if (!seqResult || !seqResult.chain) return;
+  if (!seqAudioEl.src) return;
+  seqAudioEl.currentTime = seqResult.chain.segments[0].start_s;
+  seqAudioEl.play().catch(() => {});
+});
